@@ -203,6 +203,7 @@ int main(void)
 
     int current_x = 0;
 
+
     while (!WindowShouldClose()) {
         if (IsKeyDown(KEY_UP)) target_freq += 0.1f;
         if (IsKeyDown(KEY_DOWN)) target_freq -= 0.1f;
