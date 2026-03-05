@@ -7,6 +7,7 @@
 #include <complex.h>   // C99 complex for FFT
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
 
 #define BUFF_SIZE 800
 #define FFT_SIZE 256
@@ -53,7 +54,17 @@ void *producer_func(void *ptr)
 
     float current_angle = 0.0f;
     float y_pos = (float) screenHeight/2;
-    useconds_t delay = (useconds_t)(1000000.0f / producer_sampling_frequency);
+    // useconds_t delay = (useconds_t)(1000000.0f / producer_sampling_frequency);
+
+    // 1. Calculate the total delay in nanoseconds (1 billion ns = 1 second)
+    long delay_ns = (long)(1000000000.0f / producer_sampling_frequency);
+
+    // 2. Set up the timespec struct
+    struct timespec ts;
+    ts.tv_sec = delay_ns / 1000000000;  // Extract whole seconds (if any)
+    ts.tv_nsec = delay_ns % 1000000000; // Extract the remaining nanoseconds
+
+
 
     while(1){
         // Formula: (2 * PI * freq) / sampling_rate
@@ -69,7 +80,9 @@ void *producer_func(void *ptr)
             printf("Out of space in CB\n");
             // do not error out, just skip the value
         }
-        usleep(delay);
+        // usleep(delay);
+        nanosleep(&ts, NULL);
+
     }
 
     return NULL;

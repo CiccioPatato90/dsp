@@ -1,10 +1,13 @@
 # Variables
 CC = clang
-CFLAGS = -Wall -std=c99
+CFLAGS = -Wall -std=c11 -D_POSIX_C_SOURCE=199309L
 # Homebrew usually installs to /opt/homebrew on Apple Silicon
-INCLUDE_PATH = -I/opt/homebrew/include
-LIBRARY_PATH = -L/opt/homebrew/lib
-LIBS = -lraylib -framework CoreVideo -framework IOKit -framework Cocoa -framework GLUT -framework OpenGL
+# INCLUDE_PATH = -I/opt/homebrew/include
+# LIBRARY_PATH = -L/opt/homebrew/lib
+INCLUDE_PATH = -I/usr/include
+LIBRARY_PATH = -L/usr/lib64
+LIBS = -lraylib -lm -lpthread
+MACOS_FRAMEWORK = -framework CoreVideo -framework IOKit -framework Cocoa -framework GLUT -framework OpenGL
 
 # Target name
 TARGET = app
