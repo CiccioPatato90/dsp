@@ -8,17 +8,18 @@ INCLUDE_PATH = -I/usr/include
 LIBRARY_PATH = -L/usr/lib64
 LIBS = -lraylib -lm -lpthread
 MACOS_FRAMEWORK = -framework CoreVideo -framework IOKit -framework Cocoa -framework GLUT -framework OpenGL
+OPTIMIZATION = -O3
 
 # Target name
-TARGET = app
+TARGET = main
 
-SCRIPT = test.c lib/circbuf.c
+SCRIPT = main.c lib/circbuf.c
 
 # Default rule
 all: $(TARGET)
 
 $(TARGET): $(SCRIPT)
-	$(CC) $(CFLAGS) $(INCLUDE_PATH) $(LIBRARY_PATH) $(LIBS) $(SCRIPT) -o build/$(TARGET)
+	$(CC) $(OPTIMIZATION) $(CFLAGS) $(INCLUDE_PATH) $(LIBRARY_PATH) $(LIBS) $(SCRIPT) -o build/$(TARGET)
 
 # Clean rule
 clean:
