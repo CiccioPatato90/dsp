@@ -1,6 +1,6 @@
 # Variables
 CC = clang
-CFLAGS = -Wall -std=c11 -D_POSIX_C_SOURCE=199309L
+CFLAGS = -std=c11 -D_POSIX_C_SOURCE=199309L
 # Homebrew usually installs to /opt/homebrew on Apple Silicon
 # INCLUDE_PATH = -I/opt/homebrew/include
 # LIBRARY_PATH = -L/opt/homebrew/lib

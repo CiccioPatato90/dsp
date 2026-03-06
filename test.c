@@ -1,28 +1,30 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include "raylib.h"
 #include <math.h>
-#include <complex.h>   // C99 complex for FFT
+#include <complex.h>
 #include <string.h>
-#include "circbuf.h"
 #include <unistd.h>
 #include <time.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 
+#include "raylib.h"
+#include "circbuf.h"
+#define GOERTZEL_IMPLEMENTATION
+#include "goertzel.h"
 
 #define BUFF_SIZE    4096
-#define FFT_SIZE     128          // must be power-of-2; covers ~0.5 s at 1000 Hz
+#define FFT_SIZE     32          // must be power-of-2; covers ~0.5 s at 1000 Hz
 #define SPECTRUM_H   300          // pixel height of spectrum panel
 
 CIRCBUF_DEF(float, buff, BUFF_SIZE);
 
 atomic_bool is_transmitting = false;
-const char* message = "Hello, World!";
+const char* message = "Hello, MA STAR!";
 float target_freq               = 0.1f;
-const float consumer_sampling_frequency = 120.0f;
-const float producer_sampling_frequency = 4000.0f;
+const float consumer_sampling_frequency = 1000.0f;
+const float producer_sampling_frequency = 7000.0f;
 const int   screenWidth               = 800;
 const int   screenHeight              = 800;
 
@@ -81,7 +83,7 @@ void str_to_bits(const char *str, uint8_t *out) {
 // 10 = symbols[2]
 // 11 = symbols[3]
 static const float symbols_lut[] = {
-   100.0f, 300.0f, 500.0f, 700.0f
+   120.0f, 230.0f, 340.0f, 450.0f
 };
 
 void fsk_symbols(const char* message, float* symbols) {
@@ -181,6 +183,91 @@ float bin_to_freq(int bin) {
 }
 
 
+/* Ring buffer for FFT accumulation */
+static float fft_input[FFT_SIZE];
+int fft_head = 0;
+
+void fft_push(float value){
+    if(fft_head < FFT_SIZE){
+        fft_input[fft_head++] = value;
+    }else{
+        // deal with "dropped frames"
+    }
+
+}
+
+int fft_ready(){
+    if(fft_head == FFT_SIZE){
+        return 1;
+    }else{
+        return 0;
+    }
+}
+
+void fft_flush(){
+    fft_head = 0;
+}
+
+int demod_goertzel(float* fft, int N) {
+    int32_t best_mag = -1;
+    int best_sym = 0;
+    for (int i = 0; i < 4; i++) {
+        int32_t mag = goertzel(symbols_lut[i], producer_sampling_frequency, fft, N);
+        if (mag > best_mag) {
+            best_mag = mag;
+            best_sym = i;
+        }
+    }
+    return best_sym;
+}
+
+typedef struct {
+    uint8_t* bytes;      // decoded bytes so far
+    size_t   byte_count;
+    int      bit_buf;    // current byte being built
+    int      bits_in;    // how many bits written into bit_buf (0-7)
+    size_t   capacity;
+} BitAccum;
+
+void bitaccum_init(BitAccum* a, size_t initial_capacity) {
+    a->bytes     = malloc(initial_capacity);
+    a->capacity  = initial_capacity;
+    a->byte_count = 0;
+    a->bit_buf   = 0;
+    a->bits_in   = 0;
+}
+
+void bitaccum_push(BitAccum* a, int bit) {
+    a->bit_buf = (a->bit_buf << 1) | (bit & 1);
+    a->bits_in++;
+    if (a->bits_in == 8) {
+        // grow if needed
+        if (a->byte_count >= a->capacity) {
+            a->capacity *= 2;
+            uint8_t* temp = realloc(a->bytes, a->capacity);
+            if (!temp) {
+                printf("Out of memory!\n");
+                // Handle error (e.g., free(a->bytes), exit)
+            }
+            a->bytes = temp;
+        }
+        a->bytes[a->byte_count++] = (uint8_t)a->bit_buf;
+        a->bit_buf = 0;
+        a->bits_in = 0;
+    }
+}
+
+void bitaccum_reset(BitAccum* a) {
+    a->byte_count = 0;
+    a->bit_buf    = 0;
+    a->bits_in    = 0;
+}
+
+void bitaccum_free(BitAccum* a) {
+    free(a->bytes);
+}
+
+
 int main(void)
 {
     /* Waveform panel: top 500 px  |  Spectrum panel: bottom 300 px */
@@ -192,17 +279,14 @@ int main(void)
     pthread_t producer;
     pthread_create(&producer, NULL, producer_func, NULL);
 
-    /* Ring buffer for FFT accumulation */
-    static float fft_input[FFT_SIZE];
-    int fft_head = 0;           // next write position
-    int fft_samples_ready = 0;  // how many valid samples we have so far
-
     /* Magnitude spectrum (only positive frequencies: FFT_SIZE/2 bins) */
     static float magnitude[FFT_SIZE / 2];
     memset(magnitude, 0, sizeof magnitude);
 
     int current_x = 0;
 
+    BitAccum accum;
+    bitaccum_init(&accum, 64);
 
     while (!WindowShouldClose()) {
         if (IsKeyDown(KEY_UP)) target_freq += 0.1f;
@@ -217,50 +301,78 @@ int main(void)
 
         float y = 0.0f;
 
+        static bool prev_transmitting = false;
+        bool is_tx = atomic_load(&is_transmitting);
+        static struct timespec tx_start;
+
+        if (is_tx && !prev_transmitting) {
+            clock_gettime(CLOCK_MONOTONIC, &tx_start);
+            fft_flush();
+            bitaccum_reset(&accum);
+        }
+
+
         /* ---- CONSUME BUFFER -------------------------------- */
         while (CIRCBUF_POP(buff, &y) == 0) {
             float sample = (y - 225.0f) / 100.0f;
+            fft_push(sample);
 
-            fft_input[fft_head % FFT_SIZE] = sample;
-            fft_head++;
-            if (fft_samples_ready < FFT_SIZE) fft_samples_ready++;
-        }
+            /* ---- FFT COMPUTATION --------------- */
+            if (fft_ready()) {
+                static float complex fft_buf[FFT_SIZE];
 
-        /* ---- FFT COMPUTATION --------------- */
-        if (fft_samples_ready >= FFT_SIZE) {
-            static float complex fft_buf[FFT_SIZE];
+                /* Build windowed frame (oldest → newest) with Hann window */
+                int start = fft_head;
+                for (int k = 0; k < FFT_SIZE; k++) {
+                    float hann = 0.5f * (1.0f - cosf(2.0f * PI * k / (FFT_SIZE - 1)));
+                    // here we assume that we have completely overwritten the buffer with new informations
+                    float s = fft_input[(start + k) % FFT_SIZE];
+                    fft_buf[k] = (float complex)(s * hann);
+                }
 
-            /* Build windowed frame (oldest → newest) with Hann window */
-            int start = fft_head;
-            for (int k = 0; k < FFT_SIZE; k++) {
-                float hann = 0.5f * (1.0f - cosf(2.0f * PI * k / (FFT_SIZE - 1)));
-                float s = fft_input[(start + k) % FFT_SIZE];
-                fft_buf[k] = (float complex)(s * hann);
+                fft_flush();
+
+                fft(fft_buf, FFT_SIZE);
+
+                float ref = 1.0f / FFT_SIZE;
+                for (int k = 0; k < FFT_SIZE / 2; k++) {
+                    float mag = cabsf(fft_buf[k]) * ref * 2.0f; /* *2 for one-sided */
+                    float db  = (mag > 1e-10f) ? 20.0f * log10f(mag) : -80.0f;
+                    magnitude[k] = magnitude[k] * 0.7f + db * 0.3f;
+                }
+
+                /* ---- DEMODULATION ------------------------------------------------- */
+                if (is_tx) {
+                    // int peak = find_peak_bin(magnitude, FFT_SIZE / 2);
+                    // int symbol  = bin_to_symbol(peak);
+                    // int freq = bin_to_freq(peak);
+                    // printf("detected: freq-> %d; symbol-> %.2f; peak -> %d\n", freq, symbols_lut[symbol], peak);
+                    int sym = demod_goertzel(fft_input, FFT_SIZE);
+                    int bit1 = (sym >> 1) & 1;
+                    int bit0 =  sym & 1;
+                    bitaccum_push(&accum, bit1);
+                    bitaccum_push(&accum, bit0);
+                }
             }
 
-            fft(fft_buf, FFT_SIZE);
+            if (!is_tx && prev_transmitting) {
+                struct timespec tx_end;
+                    clock_gettime(CLOCK_MONOTONIC, &tx_end);
 
-            float ref = 1.0f / FFT_SIZE;
-            for (int k = 0; k < FFT_SIZE / 2; k++) {
-                float mag = cabsf(fft_buf[k]) * ref * 2.0f; /* *2 for one-sided */
-                float db  = (mag > 1e-10f) ? 20.0f * log10f(mag) : -80.0f;
-                magnitude[k] = magnitude[k] * 0.7f + db * 0.3f;
+                    double elapsed_ms = (tx_end.tv_sec  - tx_start.tv_sec)  * 1000.0
+                                      + (tx_end.tv_nsec - tx_start.tv_nsec) / 1000000.0;
+
+                    printf("decoded: %.*s\n", (int)accum.byte_count, accum.bytes);
+                    printf("bit/s: %.2f\n", (accum.byte_count * 8) / (elapsed_ms / 1000.0));
+                    printf("transmission time: %.2f ms\n", elapsed_ms);
+                    printf("expected time: %.2f ms\n",
+                           (strlen(message) * 4 * FFT_SIZE / producer_sampling_frequency) * 1000.0);
+                    bitaccum_reset(&accum);
             }
+
+            prev_transmitting = is_tx;
         }
 
-        /* ---- DEMODULATION ------------------------------------------------- */
-        if (atomic_load(&is_transmitting) && fft_samples_ready >= FFT_SIZE) {
-            int peak = find_peak_bin(magnitude, FFT_SIZE / 2);
-
-            int symbol  = bin_to_symbol(peak);
-            int freq = bin_to_freq(peak);
-
-            printf("detected: freq-> %d; symbol-> %.2f; peak -> %d\n", freq, symbols_lut[symbol], peak);
-        }
-        else if(!atomic_load(&is_transmitting)){
-            // reset parameters
-
-        }
 
         /* ---- RENDERING ------------------------------------------------- */
         BeginDrawing();
