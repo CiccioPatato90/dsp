@@ -12,18 +12,18 @@ MACOS_FRAMEWORK = -framework CoreVideo -framework IOKit -framework Cocoa -framew
 # Target name
 TARGET = app
 
-SCRIPT = test.c circbuf.c
+SCRIPT = test.c lib/circbuf.c
 
 # Default rule
 all: $(TARGET)
 
 $(TARGET): $(SCRIPT)
-	$(CC) $(CFLAGS) $(INCLUDE_PATH) $(LIBRARY_PATH) $(LIBS) $(SCRIPT) -o $(TARGET)
+	$(CC) $(CFLAGS) $(INCLUDE_PATH) $(LIBRARY_PATH) $(LIBS) $(SCRIPT) -o build/$(TARGET)
 
 # Clean rule
 clean:
-	rm -f $(TARGET)
+	rm -f build/$(TARGET)
 
 # Run rule
 run: clean all
-	./$(TARGET)
+	./build/$(TARGET)

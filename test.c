@@ -10,9 +10,9 @@
 #include <stdlib.h>
 
 #include "raylib.h"
-#include "circbuf.h"
+#include "lib/circbuf.h"
 #define GOERTZEL_IMPLEMENTATION
-#include "goertzel.h"
+#include "lib/goertzel.h"
 
 #define BUFF_SIZE    4096
 #define FFT_SIZE     32          // must be power-of-2; covers ~0.5 s at 1000 Hz
@@ -65,8 +65,6 @@ static void fft(float complex *buf, int n){
     }
 }
 
-
-// each char becomes 8 bits, so total = len * 8
 void str_to_bits(const char *str, uint8_t *out) {
     int idx = 0;
     while (*str) {
@@ -86,6 +84,7 @@ static const float symbols_lut[] = {
    120.0f, 230.0f, 340.0f, 450.0f
 };
 
+// PRODUCER
 void fsk_symbols(const char* message, float* symbols) {
     size_t n_bits = strlen(message) * 8;
 
@@ -98,18 +97,16 @@ void fsk_symbols(const char* message, float* symbols) {
         uint8_t combined = (bits[i] << 1) | bits[i + 1];
         symbols[i / 2] = symbols_lut[combined];
     }
-
     free(bits);
 }
-
-
+// PRODUCER
 float sample_sin(float target_freq, float* current_angle){
     float delta = (2.0f * PI * target_freq) / producer_sampling_frequency;
     *current_angle += delta;
     if (*current_angle > 2.0f * PI) *current_angle -= 2.0f * PI;
     return (225 + (sinf(*current_angle) * 100));
 }
-
+// PRODUCER
 float sample_square(float target_freq, float* current_angle){
     float delta = (2.0f * PI * target_freq) / producer_sampling_frequency;
     *current_angle += delta;
@@ -121,7 +118,6 @@ float sample_square(float target_freq, float* current_angle){
 /* ------------------------------------------------------------------ */
 /*  Producer thread                                                     */
 /* ------------------------------------------------------------------ */
-// #define SAMPLES_PER_SYMBOL 128
 void *producer_func(void *ptr)
 {
     (void)ptr;
