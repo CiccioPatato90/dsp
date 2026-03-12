@@ -11,6 +11,7 @@ t = np.linspace(0, symbol_duration, samples_per_symbol, endpoint=False)
 fsk_signal = np.concatenate(
     (np.sin(2 * np.pi * frequency_1 * t), np.sin(2 * np.pi * frequency_2 * t))
 )
+
 # Perform FSK demodulation
 demodulated_signal = np.abs(np.fft.fft(fsk_signal))
 # Thresholding to extract bit string

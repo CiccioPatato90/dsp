@@ -4,6 +4,7 @@
 #include <math.h>
 #include <complex.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <time.h>
 #include <stdatomic.h>
@@ -20,9 +21,10 @@
 #define CONS_UI_BUFF_SIZE    8092
 
 #define FFT_SIZE     16          // must be power-of-2; covers ~0.5 s at 1000 Hz
-#define SPECTRUM_H   300          // pixel height of spectrum panel
+#define SPECTRUM_H   200          // pixel height of spectrum panel
 
 typedef struct {
+    uint8_t version;
     // --- Source identification ---
     enum { TELEM_PRODUCER, TELEM_CONSUMER } source;
     uint64_t timestamp_ns;          // clock_gettime monotonic, for ordering
@@ -41,14 +43,21 @@ typedef struct {
     uint64_t sample_time_ns;
 
     // --- CONSUMER fields ---
+    enum { CONS_FFT, CONS_RISING, CONS_FALLING } cons_tag;
     float   cons_value;
     float   goertzel_energies[4];   // most important consumer field
-    int     winning_margin;
     int     symbol_decoded;
     int     bits_in;
-    int     bytes_decoded;
+    int     cons_fft_bin;
+    uint8_t*decoded_bytes;
+    size_t  decoded_byte_count;
     uint8_t last_byte;
-    int     fft_drops;
+    float   effective_tx_time;
+    float   expected_tx_time;
+    float   bitrate;
+    int    popped;
+    uint64_t fft_time_ns;
+    uint64_t goertzel_time_ns;
 
     // --- Shared buffer health ---
     int     prod_cons_fill;
@@ -58,7 +67,7 @@ typedef struct {
 
 CIRCBUF_DEF(float, prod_cons_buff, PROD_CONS_BUFF_SIZE);
 CIRCBUF_DEF(Packet, prod_ui_buff, PROD_UI_BUFF_SIZE);
-CIRCBUF_DEF(float, cons_ui_buff, CONS_UI_BUFF_SIZE);
+CIRCBUF_DEF(Packet, cons_ui_buff, CONS_UI_BUFF_SIZE);
 
 
 atomic_bool is_transmitting = false;
@@ -66,37 +75,9 @@ const char* message = "Hello, MA STAR!";
 float target_freq               = 0.1f;
 const float consumer_sampling_frequency = 100000.0f;
 const float producer_sampling_frequency = 100000.0f;
-const float ui_sampling_frequency = 60.0f;
-const int   screenWidth               = 1000;
+const float ui_sampling_frequency = 120.0f;
+const int   screenWidth               = 1500;
 const int   screenHeight              = 800;
-
-void packet_print(const Packet* p) {
-    printf("[%s | t=%" PRIu64 "ns | tx=%s]\n",
-        p->source == TELEM_PRODUCER ? "PROD" : "CONS",
-        p->timestamp_ns,
-        p->is_transmitting ? "ON" : "OFF");
-
-    if (p->source == TELEM_PRODUCER) {
-        printf("  value:           %.2f Hz\n",   p->prod_value);
-        printf("  overflows:       cons=%d\n",
-            p->prod_cons_overflows);
-    } else {
-        printf("  goertzel:        [0]=%.1f [1]=%.1f [2]=%.1f [3]=%.1f\n",
-            p->goertzel_energies[0], p->goertzel_energies[1],
-            p->goertzel_energies[2], p->goertzel_energies[3]);
-        printf("  decoded sym:     %d  (margin=%d)\n",
-            p->symbol_decoded, p->winning_margin);
-        printf("  bits_in:         %d/8\n",       p->bits_in);
-        printf("  bytes decoded:   %d  last=0x%02X '%c'\n",
-            p->bytes_decoded,
-            p->last_byte,
-            (p->last_byte >= 32 && p->last_byte < 127) ? p->last_byte : '.');
-        printf("  fft drops:       %d\n",          p->fft_drops);
-    }
-
-    printf("  buf fill:        prod_cons=%d  prod_ui=%d  cons_ui=%d\n",
-        p->prod_cons_fill, p->prod_ui_fill, p->cons_ui_fill);
-}
 
 // GLOBAL
 void wait_nanosec(long delay_ns){
@@ -201,9 +182,9 @@ void *producer_func(void *ptr)
             // modulate
             for (size_t i = 0; i < n_symbols; i ++) {
                 for (int s = 0; s < FFT_SIZE; s++) {
-                    // Stopwatch compute_timer = timer_start();
+                    Stopwatch compute_timer = timer_start();
                     float y_pos = sample_sin(symbols[i], &current_angle);
-                    // uint64_t sample_time_ns = timer_elapsed_ns(compute_timer);
+                    uint64_t sample_time_ns = timer_elapsed_ns(compute_timer);
 
                     total_samples++;
 
@@ -225,7 +206,7 @@ void *producer_func(void *ptr)
                     t.prod_ui_fill = CIRCBUF_FS(prod_ui_buff);
                     t.cons_ui_fill = CIRCBUF_FS(cons_ui_buff);
                     t.cumulative_drift_ms = drift_ms;
-                    // t.sample_time_ns = sample_time_ns;
+                    t.sample_time_ns = sample_time_ns;
 
                     if (CIRCBUF_PUSH(prod_cons_buff, &y_pos)) {
                         printf("Out of space in CB\n");
@@ -239,9 +220,9 @@ void *producer_func(void *ptr)
             }
             atomic_store(&is_transmitting, false);
         }else{
-            // Stopwatch compute_timer = timer_start();
+            Stopwatch compute_timer = timer_start();
             float y_pos = sample_sin(target_freq, &current_angle);
-            // uint64_t math_time_ns = timer_elapsed_ns(compute_timer);
+            uint64_t math_time_ns = timer_elapsed_ns(compute_timer);
 
             total_samples++;
             uint64_t actual_time_ns = now_ns();
@@ -257,7 +238,7 @@ void *producer_func(void *ptr)
             t.prod_ui_fill = CIRCBUF_FS(prod_ui_buff);
             t.cons_ui_fill = CIRCBUF_FS(cons_ui_buff);
             t.cumulative_drift_ms = drift_ms;
-            // t.sample_time_ns = math_time_ns;
+            t.sample_time_ns = math_time_ns;
 
             if (CIRCBUF_PUSH(prod_cons_buff, &y_pos)){
                 printf("Out of space in CB\n");
@@ -325,11 +306,12 @@ void fft_flush(){
     sample_head = 0;
 }
 // CONSUMER
-int demod_goertzel(float* fft, int N) {
+int demod_goertzel(float* fft, int N, Packet *telemetry) {
     int32_t best_mag = -1;
     int best_sym = 0;
     for (int i = 0; i < 4; i++) {
         int32_t mag = goertzel(symbols_lut[i], producer_sampling_frequency, fft, N);
+        telemetry->goertzel_energies[i] = mag;
         if (mag > best_mag) {
             best_mag = mag;
             best_sym = i;
@@ -408,14 +390,18 @@ void *consumer_func(void *ptr){
 
         bool is_tx = atomic_load(&is_transmitting);
 
+        Packet t = {0};
+        t.source = TELEM_CONSUMER;
+        t.timestamp_ns = now_ns();
+
         if (is_tx && !prev_transmitting) {
             clock_gettime(CLOCK_MONOTONIC, &tx_start);
             fft_flush();
             bitaccum_reset(&accum);
+            t.is_transmitting = true;
         }
 
         bool falling_edge = !is_tx && prev_transmitting;
-
 
         /* ---- CONSUME BUFFER -------------------------------- */
         int popped = 0;
@@ -423,6 +409,11 @@ void *consumer_func(void *ptr){
             popped++;
             float sample = (y - 225.0f) / 100.0f;
             fft_push(sample);
+
+
+            t.prod_cons_fill = CIRCBUF_FS(prod_cons_buff);
+            t.prod_ui_fill = CIRCBUF_FS(prod_ui_buff);
+            t.cons_ui_fill = CIRCBUF_FS(cons_ui_buff);
 
             /* ---- FFT COMPUTATION --------------- */
             if (fft_ready()) {
@@ -436,9 +427,10 @@ void *consumer_func(void *ptr){
                     fft_buf[k] = (float complex)(s * hann);
                 }
 
-
-
+                Stopwatch compute_timer = timer_start();
                 fft(fft_buf, FFT_SIZE);
+                uint64_t math_time_ns = timer_elapsed_ns(compute_timer);
+                t.fft_time_ns = math_time_ns;
 
                 float ref = 1.0f / FFT_SIZE;
                 for (int k = 0; k < FFT_SIZE / 2; k++) {
@@ -448,39 +440,55 @@ void *consumer_func(void *ptr){
                     // magnitude[k] = magnitude[k] * 0.7f + db * 0.3f;
                     float res = magnitude[k] * 0.7f + db * 0.3f;
                     magnitude[k] = res;
-                    CIRCBUF_PUSH(cons_ui_buff, &res);
+                    // first return point push
+                    t.cons_value = res;
+                    t.cons_fft_bin = k;
+                    t.cons_tag = CONS_FFT;
+                    CIRCBUF_PUSH(cons_ui_buff, &t);
                 }
 
                 /* ---- DEMODULATION ------------------------------------------------- */
                 if (atomic_load(&is_transmitting)) {
-                    int sym = demod_goertzel(sample_buff, FFT_SIZE);
+                    compute_timer = timer_start();
+                    int sym = demod_goertzel(sample_buff, FFT_SIZE, &t);
+                    uint64_t math_time_ns = timer_elapsed_ns(compute_timer);
+                    t.goertzel_time_ns = math_time_ns;
+                    t.symbol_decoded = sym;
                     int bit1 = (sym >> 1) & 1;
                     int bit0 =  sym & 1;
                     bitaccum_push(&accum, bit1);
                     bitaccum_push(&accum, bit0);
+                    t.cons_tag = CONS_RISING;
+                    CIRCBUF_PUSH(cons_ui_buff, &t);
                 }
-
                 fft_flush();
             }
         }
 
         if (falling_edge) {
             struct timespec tx_end;
-                clock_gettime(CLOCK_MONOTONIC, &tx_end);
+            clock_gettime(CLOCK_MONOTONIC, &tx_end);
 
-                double elapsed_ms = (tx_end.tv_sec  - tx_start.tv_sec)  * 1000.0
-                                + (tx_end.tv_nsec - tx_start.tv_nsec) / 1000000.0;
+            double elapsed_ms = (tx_end.tv_sec  - tx_start.tv_sec)  * 1000.0
+                            + (tx_end.tv_nsec - tx_start.tv_nsec) / 1000000.0;
 
-                printf("[CONS] decoded: %.*s\n", (int)accum.byte_count, accum.bytes);
-                printf("[CONS] bit/s: %.2f\n", (accum.byte_count * 8) / (elapsed_ms / 1000.0));
-                printf("[CONS] transmission time: %.2f ms\n", elapsed_ms);
-                printf("[CONS] expected time: %.2f ms\n",
-                    (strlen(message) * 4 * FFT_SIZE / producer_sampling_frequency) * 1000.0);
-                bitaccum_reset(&accum);
+            // printf("[CONS] decoded: %.*s\n", (int)accum.byte_count, accum.bytes);
+            // printf("[CONS] bit/s: %.2f\n", (accum.byte_count * 8) / (elapsed_ms / 1000.0));
+            // printf("[CONS] transmission time: %.2f ms\n", elapsed_ms);
+            t.decoded_bytes = accum.bytes;
+            t.decoded_byte_count = accum.byte_count;
+            t.bitrate = (accum.byte_count * 8) / (elapsed_ms / 1000.0);
+            t.effective_tx_time = elapsed_ms;
+            // printf("[CONS] expected time: %.2f ms\n",
+            //     (strlen(message) * 4 * FFT_SIZE / producer_sampling_frequency) * 1000.0);
+            t.expected_tx_time = (strlen(message) * 4 * FFT_SIZE / producer_sampling_frequency) * 1000.0;
+            bitaccum_reset(&accum);
+            t.popped = popped;
+            t.cons_tag = CONS_FALLING;
+            CIRCBUF_PUSH(cons_ui_buff, &t);
         }
 
         prev_transmitting = is_tx;
-
 
         if (popped == 0) {
             wait_nanosec(delay_ns);
@@ -510,7 +518,7 @@ int main(void)
     Packet prod_ui_buff_local[PROD_CONS_BUFF_SIZE] = {0};
     int prod_ui_buff_head = 0;
 
-    float cons_ui_buff_local[FFT_SIZE] = {0};
+    Packet cons_ui_buff_local[FFT_SIZE] = {0};
     int cons_ui_buff_head = 0;
 
     while (!WindowShouldClose()) {
@@ -525,104 +533,174 @@ int main(void)
         }
 
 
-        // DRAINING BUFFERS
+        /* =========================================================
+           DRAIN BUFFERS
+           ========================================================= */
+        static float spectrum[FFT_SIZE / 2] = {0};
+        static Packet last_falling = {0};
+
         Packet prod_packet;
         while (CIRCBUF_POP(prod_ui_buff, &prod_packet) == 0) {
-            prod_ui_buff_local[prod_ui_buff_head++] = prod_packet;
-            if (prod_ui_buff_head >= PROD_CONS_BUFF_SIZE) prod_ui_buff_head = 0; // Wrap around
+            prod_ui_buff_local[prod_ui_buff_head] = prod_packet;
+            prod_ui_buff_head = (prod_ui_buff_head + 1) % PROD_CONS_BUFF_SIZE;
         }
 
-        float cons_val;
-        while (CIRCBUF_POP(cons_ui_buff, &cons_val) == 0){
-            cons_ui_buff_local[cons_ui_buff_head++] = cons_val;
-            if (cons_ui_buff_head >= (FFT_SIZE / 2)) cons_ui_buff_head = 0; // Wrap around
+        Packet cons_packet;
+        while (CIRCBUF_POP(cons_ui_buff, &cons_packet) == 0) {
+            cons_ui_buff_local[cons_ui_buff_head] = cons_packet;
+            cons_ui_buff_head = (cons_ui_buff_head + 1) % CONS_UI_BUFF_SIZE;
+
+            if (cons_packet.cons_tag == CONS_FFT)
+                spectrum[cons_packet.cons_fft_bin] = cons_packet.cons_value;
+            if (cons_packet.cons_tag == CONS_FALLING)
+                last_falling = cons_packet;
         }
 
-        /* ---- RENDERING ------------------------------------------------- */
+        /* =========================================================
+           LAYOUT CONSTANTS
+           ========================================================= */
+        const int ROW          = 16;
+        const int TELEM_HISTORY = 16;
+        const int PANEL_W      = 280;
+        const int PANEL_H      = TELEM_HISTORY * ROW + 30;
+        const int MARGIN       = 10;
+        const int TELEMETRY_FONT_SIZE = 17;
+
+        // Anchor panels to top-right, side by side
+        const int PROD_X = screenWidth - 2 * (PANEL_W + MARGIN);
+        const int CONS_X = screenWidth - 1 * (PANEL_W + MARGIN);
+        const int PANEL_Y = MARGIN;
+
+        /* =========================================================
+           DRAW
+           ========================================================= */
         BeginDrawing();
         ClearBackground(BLACK);
 
-        /* PRODUCER RENDERING */
-        const int TX = screenWidth - 280;
-        const int TY = 10;
-        const int ROW = 16;
-        const int TELEM_HISTORY = 16;
-
-        DrawRectangle(TX - 5, TY - 5, 275, TELEM_HISTORY * ROW + 30, (Color){0,0,0,180});
-        DrawText("PRODUCER TELEMETRY", TX, TY, 12, YELLOW);
-        // Step backwards to get the 16 most recent packets
-        for (int i = 0; i < TELEM_HISTORY; i++) {
-            // Correct modulo math to safely step backwards in a circular buffer
-            int idx = (prod_ui_buff_head - 1 - i + PROD_CONS_BUFF_SIZE) % PROD_CONS_BUFF_SIZE;
-            Packet* p = &prod_ui_buff_local[idx];
-
-            // Skip empty structs if the buffer hasn't filled up yet
-            if (p->timestamp_ns == 0) continue;
-
-            DrawText(
-                TextFormat("symbol=%d drift=%.2f pc=%d ui=%d",
-                    p->symbol_index,
-                    p->cumulative_drift_ms,
-                    p->prod_cons_fill,
-                    p->prod_ui_fill),
-                TX, TY + (i + 1) * ROW, 20,
-                p->is_transmitting ? GREEN : GRAY);
-        }
-
-        /* PRODUCER RENDERING (Waveform) */
+        /* ---------------------------------------------------------
+           WAVEFORM (top area)
+           --------------------------------------------------------- */
         DrawLine(0, waveH, screenWidth, waveH, DARKGRAY);
-        DrawText(TextFormat("Frequency: %.1f Hz", target_freq), 20, 20, 20, WHITE);
+        DrawText(TextFormat("Target: %.0f Hz", target_freq), 10, 10, 16, WHITE);
+
         float x_step = (float)screenWidth / (FFT_SIZE - 1);
         for (int k = 1; k < FFT_SIZE; k++) {
-            // 1. Modulo by the ACTUAL array size (PROD_CONS_BUFF_SIZE), not FFT_SIZE
-            // 2. Safely step backwards from the head to get the newest data
             int idx_prev = (prod_ui_buff_head - FFT_SIZE + k - 1 + PROD_CONS_BUFF_SIZE) % PROD_CONS_BUFF_SIZE;
             int idx_curr = (prod_ui_buff_head - FFT_SIZE + k     + PROD_CONS_BUFF_SIZE) % PROD_CONS_BUFF_SIZE;
-
-            // 3. Just use the raw value! It is already scaled by sample_sin()
-            float val_prev = prod_ui_buff_local[idx_prev].prod_value;
-            float val_curr = prod_ui_buff_local[idx_curr].prod_value;
-
-            // Draw line connecting them, stretched across the screen
             DrawLineV(
-                (Vector2){ (k - 1) * x_step, val_prev },
-                (Vector2){ k * x_step,       val_curr },
+                (Vector2){ (k - 1) * x_step, prod_ui_buff_local[idx_prev].prod_value },
+                (Vector2){ k       * x_step, prod_ui_buff_local[idx_curr].prod_value },
                 RED
             );
         }
 
-
-
-        /* CONSUMER RENDERING */
-        const int bins     = FFT_SIZE / 2;
-        const float barW   = (float)screenWidth / bins;
-        const float db_min = -80.0f;
-        const float db_max =   0.0f;
-        const float freq_res = producer_sampling_frequency / FFT_SIZE; /* Hz per bin */
+        /* ---------------------------------------------------------
+           SPECTRUM (bottom area)
+           --------------------------------------------------------- */
+        const int    bins     = FFT_SIZE / 2;
+        const float  barW     = (float)screenWidth / bins;
+        const float  db_min   = -80.0f;
+        const float  db_max   =   0.0f;
+        const float  freq_res = producer_sampling_frequency / FFT_SIZE;
 
         for (int k = 0; k < bins; k++) {
-            float db     = cons_ui_buff_local[k];
-            float norm   = (db - db_min) / (db_max - db_min);   /* 0..1 */
-            if (norm < 0.0f) norm = 0.0f;
-            if (norm > 1.0f) norm = 1.0f;
-
+            float norm = (spectrum[k] - db_min) / (db_max - db_min);
+            norm = fmaxf(0.0f, fminf(1.0f, norm));
             int barH = (int)(norm * SPECTRUM_H);
             int x    = (int)(k * barW);
             int y0   = screenHeight - barH;
-
-            /* Colour: cyan → yellow based on intensity */
             Color col = ColorFromHSV(180.0f - norm * 60.0f, 1.0f, 0.9f);
             DrawRectangle(x, y0, (int)barW > 1 ? (int)barW - 1 : 1, barH, col);
         }
 
-        /* Frequency axis labels */
-        for (int hz = 0; hz <= (int)(producer_sampling_frequency / 2); hz += 50) {
+        // Frequency axis labels
+        for (int hz = 0; hz <= (int)(producer_sampling_frequency / 2); hz += 1000) {
             int x = (int)((hz / freq_res) * barW);
             if (x >= screenWidth) break;
             DrawLine(x, waveH, x, screenHeight, DARKGRAY);
-            DrawText(TextFormat("%d", hz), x + 2, waveH + 4, 10, GRAY);
+            DrawText(TextFormat("%dk", hz / 1000), x + 2, waveH + 4, 10, GRAY);
         }
 
+        // Target frequency marker
+        {
+            int tx = (int)((target_freq / freq_res) * barW);
+            DrawLine(tx, waveH, tx, screenHeight, YELLOW);
+            DrawText(TextFormat("%.0fHz", target_freq), tx + 2, waveH + 16, 10, YELLOW);
+        }
+
+        /* ---------------------------------------------------------
+           PRODUCER TELEMETRY PANEL
+           --------------------------------------------------------- */
+        DrawRectangle(PROD_X - 5, PANEL_Y - 5, PANEL_W, PANEL_H, (Color){0,0,0,200});
+        DrawText("PRODUCER", PROD_X, PANEL_Y, TELEMETRY_FONT_SIZE + 3, YELLOW);
+
+        for (int i = 0; i < TELEM_HISTORY; i++) {
+            int idx = (prod_ui_buff_head - 1 - i + PROD_CONS_BUFF_SIZE) % PROD_CONS_BUFF_SIZE;
+            Packet *p = &prod_ui_buff_local[idx];
+            if (p->timestamp_ns == 0) continue;
+            DrawText(
+                TextFormat("sym=%d drift=%.2f pc=%d",
+                    p->symbol_index,
+                    p->cumulative_drift_ms,
+                    p->prod_cons_fill),
+                PROD_X, PANEL_Y + (i + 1) * ROW, TELEMETRY_FONT_SIZE,
+                p->is_transmitting ? GREEN : GRAY);
+        }
+
+        /* ---------------------------------------------------------
+           CONSUMER TELEMETRY PANEL
+           --------------------------------------------------------- */
+        DrawRectangle(CONS_X - 5, PANEL_Y - 5, PANEL_W, PANEL_H, (Color){0,0,0,200});
+        DrawText("CONSUMER", CONS_X, PANEL_Y, TELEMETRY_FONT_SIZE + 3, YELLOW);
+
+        for (int i = 0; i < TELEM_HISTORY; i++) {
+            int idx = (cons_ui_buff_head - 1 - i + CONS_UI_BUFF_SIZE) % CONS_UI_BUFF_SIZE;
+            Packet *p = &cons_ui_buff_local[idx];
+            if (p->timestamp_ns == 0) continue;
+
+            Color col = GRAY;
+            const char *tag_str = "---";
+            if (p->cons_tag == CONS_FFT)     { col = SKYBLUE; tag_str = "FFT"; }
+            if (p->cons_tag == CONS_RISING)  { col = GREEN;   tag_str = "SYM"; }
+            if (p->cons_tag == CONS_FALLING) { col = ORANGE;  tag_str = "END"; }
+
+            DrawText(
+                TextFormat("[%s] sym=%d fft=%lluus gz=%lluus",
+                    tag_str,
+                    p->symbol_decoded,
+                    p->fft_time_ns   / 1000,
+                    p->goertzel_time_ns / 1000),
+                CONS_X, PANEL_Y + (i + 1) * ROW, TELEMETRY_FONT_SIZE, col);
+        }
+
+        /* ---------------------------------------------------------
+           DECODED RESULT PANEL (persists from last transmission)
+           --------------------------------------------------------- */
+        if (last_falling.timestamp_ns != 0) {
+            const int RX = PROD_X - 5;
+            const int RY = PANEL_Y + PANEL_H + MARGIN;
+            const int RW = 2 * PANEL_W + MARGIN;
+            const int RH = 70;
+
+            DrawRectangle(RX, RY, RW, RH, (Color){0,0,0,200});
+            DrawRectangleLines(RX, RY, RW, RH, ORANGE);
+
+            bool time_ok = fabsf(last_falling.effective_tx_time - last_falling.expected_tx_time) < 50.0f;
+
+            DrawText(
+                TextFormat("MSG:     %.*s",
+                    (int)last_falling.decoded_byte_count,
+                    last_falling.decoded_bytes),
+                RX + 8, RY + 8, TELEMETRY_FONT_SIZE + 3, WHITE);
+            DrawText(
+                TextFormat("BITRATE: %.1f bit/s", last_falling.bitrate),
+                RX + 8, RY + 28, TELEMETRY_FONT_SIZE + 3, SKYBLUE);
+            DrawText(
+                TextFormat("TIME:    %.1f ms  (expected %.1f ms)",
+                    last_falling.effective_tx_time,
+                    last_falling.expected_tx_time),
+                RX + 8, RY + 48, TELEMETRY_FONT_SIZE + 3, time_ok ? GREEN : RED);
+        }
 
         EndDrawing();
     }
